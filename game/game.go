@@ -257,6 +257,7 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 				buttons[i][j] = button
 			}
 		}
+		setFocus(focusedRow, focusedCol)
 		resetSubmitButton()
 	}
 
