@@ -62,6 +62,7 @@ func RunWithScreen(screen tcell.Screen) error {
 	app.SetScreen(screen)
 
 	var loading bool
+	var cancelBlink func()
 	var navigate func(d time.Time)
 	navigate = func(d time.Time) {
 		if loading {
@@ -75,18 +76,23 @@ func RunWithScreen(screen tcell.Screen) error {
 				return
 			}
 			app.QueueUpdateDraw(func() {
-				root := buildUI(app, screen, navigate)
+				if cancelBlink != nil {
+					cancelBlink()
+				}
+				root, cb := buildUI(app, screen, navigate)
+				cancelBlink = cb
 				app.SetRoot(root, true)
 				loading = false
 			})
 		}()
 	}
 
-	root := buildUI(app, screen, navigate)
+	root, cb := buildUI(app, screen, navigate)
+	cancelBlink = cb
 	return app.SetRoot(root, true).EnableMouse(true).Run()
 }
 
-func buildUI(app *tview.Application, screen tcell.Screen, navigate func(time.Time)) tview.Primitive {
+func buildUI(app *tview.Application, screen tcell.Screen, navigate func(time.Time)) (tview.Primitive, func()) {
 	gameState := GameState{
 		selectedCards: make(map[string]bool),
 		categories:    make(map[string]Group),
@@ -180,9 +186,15 @@ func buildUI(app *tview.Application, screen tcell.Screen, navigate func(time.Tim
 	}
 
 	setFocus := func(r, c int) {
-		// Unset previous button's border.
+		// Unset previous button's border and style.
 		if focusedRow < 4 && focusedRow >= 0 {
-			findButton(focusedRow, focusedCol).SetBorderColor(tcell.ColorDarkGray)
+			prev := findButton(focusedRow, focusedCol)
+			prev.SetBorderColor(tcell.ColorDarkGray)
+			if gameState.selectedCards[prev.GetLabel()] {
+				prev.SetStyle(selectedStyle)
+			} else {
+				prev.SetStyle(tcell.StyleDefault)
+			}
 		}
 		focusedRow = r
 		focusedCol = c
@@ -637,5 +649,32 @@ func buildUI(app *tview.Application, screen tcell.Screen, navigate func(time.Tim
 		AddItem(contentFlex, 80, 1, true).    // The centered game column.
 		AddItem(tview.NewBox(), 0, 1, false)  // Right spacer.
 
-	return flex
+	blinkDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		blinkState := false
+		for {
+			select {
+			case <-blinkDone:
+				return
+			case <-ticker.C:
+				app.QueueUpdateDraw(func() {
+					if focusedRow < 4 && focusedRow >= 0 {
+						button := findButton(focusedRow, focusedCol)
+						if blinkState {
+							button.SetBorderColor(tcell.ColorGray)
+							button.SetStyle(selectedStyle)
+						} else {
+							button.SetBorderColor(tcell.ColorDarkGray)
+							button.SetStyle(tcell.StyleDefault)
+						}
+						blinkState = !blinkState
+					}
+				})
+			}
+		}
+	}()
+
+	return flex, func() { close(blinkDone) }
 }
