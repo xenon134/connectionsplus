@@ -52,7 +52,7 @@ type GameState struct {
 	currentMatchRow int
 	history         []string // One emoji row per submitted guess.
 	mistakes        int
-	wrongGuesses    map[string]bool // Distinct incorrect guesses, keyed by emoji row.
+	wrongGuesses    map[string]bool // Distinct incorrect guesses, keyed by joined sorted words.
 }
 
 func fetch(urlString string) ([]byte, error) {
@@ -362,6 +362,7 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 			row += tileEmoji[gameState.categories[w].Index]
 		}
 		gameState.history = append(gameState.history, row)
+		guessKey := strings.Join(words, ",")
 
 		var categoryTitle string
 		var categoryIndex int
@@ -451,14 +452,14 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 				SetStyle(tcell.StyleDefault.Background(tcell.ColorGreen).Foreground(tcell.ColorBlack.TrueColor())).
 				SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorGreen).Foreground(tcell.ColorBlack.TrueColor()))
 		case offByOne:
-			if gameState.wrongGuesses[row] {
+			if gameState.wrongGuesses[guessKey] {
 				submitButton.
 					SetStyle(tcell.StyleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack.TrueColor())).
 					SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack.TrueColor())).
 					SetLabel("One away...")
 				break
 			}
-			gameState.wrongGuesses[row] = true
+			gameState.wrongGuesses[guessKey] = true
 			gameState.mistakes++
 			updateMistakes()
 			submitButton.
@@ -466,14 +467,14 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 				SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack.TrueColor())).
 				SetLabel("One away...")
 		default:
-			if gameState.wrongGuesses[row] {
+			if gameState.wrongGuesses[guessKey] {
 				submitButton.
 					SetStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorBlack.TrueColor())).
 					SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorBlack.TrueColor())).
 					SetLabel("Already Guessed")
 				break
 			}
-			gameState.wrongGuesses[row] = true
+			gameState.wrongGuesses[guessKey] = true
 			gameState.mistakes++
 			updateMistakes()
 			submitButton.
