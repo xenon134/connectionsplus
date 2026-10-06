@@ -1,17 +1,10 @@
 package game
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"maps"
 	"math/rand"
-	"net/http"
-	"net/url"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -23,28 +16,11 @@ import (
 	"golang.org/x/text/language"
 )
 
-type Response struct {
-	Status     string     `json:"status"`
-	ID         int        `json:"id"`
-	PrintDate  string     `json:"print_date"`
-	Editor     string     `json:"editor"`
-	Categories []Category `json:"categories"`
-}
-
-type Category struct {
-	Title string `json:"title"`
-	Cards []Card `json:"cards"`
-}
-
-type Card struct {
-	Content  string `json:"content"`
-	Position int    `json:"position"`
-}
-
-type Group struct {
-	Title string
-	Index int
-}
+var (
+	currentDate    time.Time
+	puzzleResponse Response
+	nextDate       time.Time // zero = exit, non-zero = load that date
+)
 
 type GameState struct {
 	selectedCards   map[string]bool
@@ -55,80 +31,6 @@ type GameState struct {
 	wrongGuesses    map[string]bool // Distinct incorrect guesses, keyed by emoji row.
 }
 
-func fetch(urlString string) ([]byte, error) {
-	resp, err := http.Get(urlString)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch from URL: %w", err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			log.Printf("failed to close response body: %v", err)
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	return data, nil
-}
-
-func getConnectionsJSON(date time.Time) ([]byte, error) {
-	jsonFilename := fmt.Sprintf("%s.json", date.Format("2006-01-02"))
-
-	dataUrl, err := url.JoinPath("https://www.nytimes.com/svc/connections/v2/", jsonFilename)
-	if err != nil {
-		return nil, fmt.Errorf("failed to join URL: %w", err)
-	}
-
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		cacheDir = filepath.Join(os.Getenv("HOME"), ".cache")
-	}
-
-	connectionsCache := filepath.Join(cacheDir, "connections")
-	if err := os.MkdirAll(connectionsCache, 0755); err != nil {
-		connectionsData, err := fetch(dataUrl)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch data: %w", err)
-		}
-
-		return connectionsData, nil
-	}
-
-	cacheFile := filepath.Join(connectionsCache, jsonFilename)
-	cachedData, err := os.ReadFile(cacheFile)
-	if err != nil {
-		connectionsData, err := fetch(dataUrl)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch data: %w", err)
-		}
-
-		err = os.WriteFile(cacheFile, connectionsData, 0644)
-		if err != nil {
-			log.Printf("failed to save to cache: %v", err)
-		}
-		return connectionsData, nil
-	}
-	return cachedData, nil
-}
-
-func parseConnectionsJSON(data []byte) (Response, error) {
-	var response Response
-
-	err := json.Unmarshal([]byte(data), &response)
-	if err != nil {
-		return response, fmt.Errorf("error parsing JSON: %w", err)
-	}
-	return response, nil
-}
-
-// tileEmoji maps a category index to the emoji used in the share string.
 var tileEmoji = [4]string{"🟨", "🟩", "🟦", "🟪"}
 
 // copyToClipboard copies text using the platform's clipboard utility.
@@ -151,34 +53,52 @@ func copyToClipboard(text string) error {
 }
 
 func RunWithScreen(screen tcell.Screen) error {
+	loadProgress()
+	if err := loadPuzzleForDate(time.Now()); err != nil {
+		return err
+	}
+
 	app := tview.NewApplication()
 	app.SetScreen(screen)
-	return Run(app, screen)
+
+	var loading bool
+	var navigate func(d time.Time)
+	navigate = func(d time.Time) {
+		if loading {
+			return
+		}
+		loading = true
+		go func() {
+			err := loadPuzzleForDate(d)
+			if err != nil {
+				app.QueueUpdateDraw(func() { loading = false })
+				return
+			}
+			app.QueueUpdateDraw(func() {
+				root := buildUI(app, screen, navigate)
+				app.SetRoot(root, true)
+				loading = false
+			})
+		}()
+	}
+
+	root := buildUI(app, screen, navigate)
+	return app.SetRoot(root, true).EnableMouse(true).Run()
 }
 
-func Run(app *tview.Application, screen tcell.Screen) error {
+func buildUI(app *tview.Application, screen tcell.Screen, navigate func(time.Time)) tview.Primitive {
 	gameState := GameState{
 		selectedCards: make(map[string]bool),
 		categories:    make(map[string]Group),
 		wrongGuesses:  make(map[string]bool),
 	}
 
-	today := time.Now()
-	connectionsData, err := getConnectionsJSON(today)
-	if err != nil {
-		return err
-	}
-	response, err := parseConnectionsJSON(connectionsData)
-	if err != nil {
-		return err
-	}
+	response := puzzleResponse
+	date := currentDate
 
 	// The Connections puzzle number is derived from the print date: puzzle #1
 	// was 2023-06-12. Used by the header and the share string.
-	puzzleNumber := response.ID
-	if date, err := time.Parse("2006-01-02", response.PrintDate); err == nil {
-		puzzleNumber = int(date.Sub(time.Date(2023, 6, 12, 0, 0, 0, 0, time.UTC)).Hours()/24) + 1
-	}
+	puzzleNumber := int(date.Sub(time.Date(2023, 6, 12, 0, 0, 0, 0, time.UTC)).Hours()/24) + 1
 
 	grid := tview.NewGrid().
 		SetRows(3, 3, 3, 3, 3). // Extra row for submit button.
@@ -203,6 +123,21 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 		SetText("Mistakes Remaining: ● ● ● ●")
 
 	gameOver := false
+	replaying := false
+
+	prevBtn := tview.NewButton("<").
+		SetSelectedFunc(func() {
+			navigate(currentDate.AddDate(0, 0, -1))
+		}).
+		SetStyle(tcell.StyleDefault).
+		SetActivatedStyle(selectedStyle)
+
+	nextBtn := tview.NewButton(">").
+		SetSelectedFunc(func() {
+			navigate(currentDate.AddDate(0, 0, 1))
+		}).
+		SetStyle(tcell.StyleDefault).
+		SetActivatedStyle(selectedStyle)
 
 	updateMistakes := func() {
 		if remaining := 4 - gameState.mistakes; remaining > 0 {
@@ -222,6 +157,12 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 	}
 
 	findButton := func(r, c int) *tview.Button {
+		if r == -1 {
+			if c == 0 {
+				return prevBtn
+			}
+			return nextBtn
+		}
 		if r == 4 {
 			if gameOver {
 				return shareButton
@@ -240,14 +181,14 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 
 	setFocus := func(r, c int) {
 		// Unset previous button's border.
-		if focusedRow < 4 {
+		if focusedRow < 4 && focusedRow >= 0 {
 			findButton(focusedRow, focusedCol).SetBorderColor(tcell.ColorDarkGray)
 		}
 		focusedRow = r
 		focusedCol = c
 		// Set current button's border.
 		button := findButton(focusedRow, focusedCol)
-		if focusedRow < 4 {
+		if focusedRow < 4 && focusedRow >= 0 {
 			button.SetBorderColor(tcell.ColorGray)
 		}
 		app.SetFocus(button)
@@ -349,14 +290,30 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 			return
 		}
 
-		// Record the guess as a row of category emojis, ordered by category.
 		words := slices.Collect(maps.Keys(gameState.selectedCards))
+
 		slices.SortStableFunc(words, func(a, b string) int {
 			if ai, bi := gameState.categories[a].Index, gameState.categories[b].Index; ai != bi {
 				return ai - bi
 			}
 			return strings.Compare(a, b)
 		})
+
+		guessKey := strings.Join(words, ",")
+		if gameState.wrongGuesses[guessKey] {
+			submitButton.
+				SetStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorBlack.TrueColor())).
+				SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorBlack.TrueColor())).
+				SetLabel("Already Guessed")
+			return
+		}
+
+		if !replaying {
+			dateKey := currentDate.Format("2006-01-02")
+			progress[dateKey] = append(progress[dateKey], slices.Clone(words))
+			saveProgress()
+		}
+
 		row := ""
 		for _, w := range words {
 			row += tileEmoji[gameState.categories[w].Index]
@@ -405,22 +362,31 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 			}
 			grid.AddItem(button, gameState.currentMatchRow, 0, 1, 4, 0, 0, false)
 
-			buttonsToMove := []*tview.Button{}
-			for i := range 4 {
+			// Collect all remaining buttons that were not selected
+			var remainingButtons []*tview.Button
+			for i := gameState.currentMatchRow; i < 4; i++ {
 				for j := range 4 {
 					button := buttons[i][j]
-					wasSelected := gameState.selectedCards[button.GetLabel()]
-					if i == gameState.currentMatchRow && !wasSelected {
-						buttonsToMove = append(buttonsToMove, button)
-						grid.RemoveItem(button)
+					if button == nil {
+						continue
 					}
-					if wasSelected {
-						grid.RemoveItem(button)
-						if i != gameState.currentMatchRow && len(buttonsToMove) > 0 {
-							grid.AddItem(buttonsToMove[0], i, j, 1, 1, 0, 0, false)
-							buttons[i][j] = buttonsToMove[0]
-							buttonsToMove = buttonsToMove[1:]
-						}
+					grid.RemoveItem(button)
+					if !gameState.selectedCards[button.GetLabel()] {
+						remainingButtons = append(remainingButtons, button)
+					}
+				}
+			}
+			// Place remaining buttons into the grid starting from currentMatchRow + 1
+			remIdx := 0
+			for i := gameState.currentMatchRow + 1; i < 4; i++ {
+				for j := range 4 {
+					if remIdx < len(remainingButtons) {
+						btn := remainingButtons[remIdx].SetSelectedFunc(handleClick(i, j))
+						buttons[i][j] = btn
+						grid.AddItem(btn, i, j, 1, 1, 0, 0, false)
+						remIdx++
+					} else {
+						buttons[i][j] = nil
 					}
 				}
 			}
@@ -451,14 +417,7 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 				SetStyle(tcell.StyleDefault.Background(tcell.ColorGreen).Foreground(tcell.ColorBlack.TrueColor())).
 				SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorGreen).Foreground(tcell.ColorBlack.TrueColor()))
 		case offByOne:
-			if gameState.wrongGuesses[row] {
-				submitButton.
-					SetStyle(tcell.StyleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack.TrueColor())).
-					SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack.TrueColor())).
-					SetLabel("One away...")
-				break
-			}
-			gameState.wrongGuesses[row] = true
+			gameState.wrongGuesses[guessKey] = true
 			gameState.mistakes++
 			updateMistakes()
 			submitButton.
@@ -466,14 +425,7 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 				SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack.TrueColor())).
 				SetLabel("One away...")
 		default:
-			if gameState.wrongGuesses[row] {
-				submitButton.
-					SetStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorBlack.TrueColor())).
-					SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorBlack.TrueColor())).
-					SetLabel("Already Guessed")
-				break;
-			}
-			gameState.wrongGuesses[row] = true
+			gameState.wrongGuesses[guessKey] = true
 			gameState.mistakes++
 			updateMistakes()
 			submitButton.
@@ -523,7 +475,26 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 	grid.AddItem(submitButton, 4, 1, 1, 2, 0, 0, false)
 	grid.AddItem(deselectButton, 4, 3, 1, 1, 0, 0, false)
 
-	grid.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	// Replay saved submissions history for the current date
+	dateKey := currentDate.Format("2006-01-02")
+	if pastSubmissions, ok := progress[dateKey]; ok {
+		replaying = true
+		for _, guess := range pastSubmissions {
+			if len(guess) != 4 || gameOver {
+				continue
+			}
+			for _, w := range guess {
+				gameState.selectedCards[w] = true
+			}
+			handleSubmit()
+			clear(gameState.selectedCards)
+		}
+		replaying = false
+		// Reset submit button state after replay
+		resetSubmitButton()
+	}
+
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		r := focusedRow
 		c := focusedCol
 
@@ -543,15 +514,23 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 		case event.Key() == tcell.KeyUp, event.Key() == tcell.KeyRune && event.Rune() == 'k':
 			if r > gameState.currentMatchRow {
 				r--
+			} else if r == gameState.currentMatchRow {
+				r = -1
+				c = 0
 			}
 			resetSubmitButton()
 		case event.Key() == tcell.KeyDown, event.Key() == tcell.KeyRune && event.Rune() == 'j':
-			if r < 4 {
+			if r == -1 {
+				r = gameState.currentMatchRow
+				c = 0
+			} else if r < 4 {
 				r++
 			}
 			resetSubmitButton()
 		case event.Key() == tcell.KeyLeft, event.Key() == tcell.KeyRune && event.Rune() == 'h':
-			if c > 0 {
+			if r == -1 {
+				c = 0
+			} else if c > 0 {
 				if r == 4 && c == 2 {
 					c--
 				}
@@ -559,7 +538,9 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 			}
 			resetSubmitButton()
 		case event.Key() == tcell.KeyRight, event.Key() == tcell.KeyRune && event.Rune() == 'l':
-			if c < 3 {
+			if r == -1 {
+				c = 1
+			} else if c < 3 {
 				if r == 4 && c == 1 {
 					c++
 				}
@@ -567,7 +548,14 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 			}
 			resetSubmitButton()
 		case event.Key() == tcell.KeyEnter, event.Key() == tcell.KeyRune && event.Rune() == ' ':
-			if r == 4 {
+			if r == -1 {
+				if c == 0 {
+					navigate(currentDate.AddDate(0, 0, -1))
+				} else {
+					navigate(currentDate.AddDate(0, 0, 1))
+				}
+				return nil
+			} else if r == 4 {
 				if gameOver {
 					handleShare()
 					break
@@ -592,7 +580,7 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 				resetSubmitButton()
 			}
 		default:
-			return nil
+			return event
 		}
 
 		setFocus(r, c)
@@ -603,7 +591,13 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 
 	headerText := tview.NewTextView().
 		SetTextAlign(tview.AlignCenter).
-		SetText(fmt.Sprintf("Connections #%d\nBy %s", puzzleNumber, response.Editor))
+		SetText(fmt.Sprintf("Connections #%d\n%s %d, %d", puzzleNumber, date.Format("January"), date.Day(), date.Year()))
+
+	headerRow := tview.NewFlex().
+		SetDirection(tview.FlexColumn).
+		AddItem(prevBtn, 3, 0, false).
+		AddItem(headerText, 0, 1, false).
+		AddItem(nextBtn, 3, 0, false)
 
 	// The game content needs 19 rows: header (2), gap (1), grid (15), and the
 	// mistakes counter (1). Extra terminal rows are split evenly above and
@@ -625,7 +619,7 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 		}
 		contentFlex.Clear().
 			AddItem(topSpacer, extra/2+extra%2, 0, false).
-			AddItem(headerText, 2, 0, false).
+			AddItem(headerRow, 2, 0, false).
 			AddItem(headerGap, 1, 0, false).
 			AddItem(grid, 0, 1, true).
 			AddItem(footer, 1, 0, false).
@@ -643,8 +637,5 @@ func Run(app *tview.Application, screen tcell.Screen) error {
 		AddItem(contentFlex, 80, 1, true).    // The centered game column.
 		AddItem(tview.NewBox(), 0, 1, false)  // Right spacer.
 
-	if err := app.SetRoot(flex, true).EnableMouse(true).Run(); err != nil {
-		return err
-	}
-	return nil
+	return flex
 }
